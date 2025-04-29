@@ -1,0 +1,184 @@
+HBase normally stores data in HDFS, which is backed by instance storage or EBS only during the EMR cluster's lifetime
+
+You cannot reuse EBS snapshots across new EMR clusters by default, unless:
+
+You manually mount EBS volumes
+
+You reconfigure HDFS/HBase to use these volumes
+
+You restore the file system or HBase backup from the EBS volume after mounting
+
+
+Create EBS volumes manually
+
+Attach them to EMR core nodes
+
+Optionally take EBS snapshots
+
+Restore those EBS volumes from snapshots on next launch
+
+Mount and configure them using Bootstrap Actions
+
+emr-hbase-ebs-backup/
+├── main.tf
+├── variables.tf
+├── outputs.tf
+├── bootstrap/
+│   └── mount-ebs.sh
+
+***variable.tf
+
+variable "region" { default = "us-east-1" }
+variable "subnet_id" {}
+variable "key_name" {}
+variable "log_uri" {}
+variable "snapshot_id" {
+  default = "" # snapshot ID to restore from (if any)
+}
+
+
+
+******bootstrap/
+This script mounts EBS to /mnt/data and updates HDFS to use it.
+
+
+#!/bin/bash
+DEVICE=/dev/xvdb
+MOUNT_POINT=/mnt/data
+
+# wait for the device
+while [ ! -e $DEVICE ]; do sleep 1; done
+
+# format if needed
+file -s $DEVICE | grep "data" && mkfs -t ext4 $DEVICE
+
+mkdir -p $MOUNT_POINT
+mount $DEVICE $MOUNT_POINT
+
+echo "$DEVICE $MOUNT_POINT ext4 defaults,nofail 0 2" >> /etc/fstab
+chown -R hadoop:hadoop $MOUNT_POINT
+
+***
+
+upload in S3
+
+aws s3 cp bootstrap/mount-ebs.sh s3://your-bootstrap-scripts/mount-ebs.sh
+
+
+****main.tf
+
+provider "aws" {
+  region = var.region
+}
+
+resource "aws_security_group" "emr_sg" {
+  name        = "emr-security-group"
+  description = "EMR SG"
+  vpc_id      = data.aws_subnet.selected.vpc_id
+}
+
+data "aws_subnet" "selected" {
+  id = var.subnet_id
+}
+
+resource "aws_ebs_volume" "hbase_data" {
+  availability_zone = data.aws_subnet.selected.availability_zone
+  size              = 100
+  type              = "gp3"
+
+  # Use snapshot if provided
+  snapshot_id = var.snapshot_id != "" ? var.snapshot_id : null
+
+  tags = {
+    Name = "hbase-data-volume"
+  }
+}
+
+resource "aws_emr_cluster" "hbase" {
+  name          = "hbase-emr-ebs"
+  release_label = "emr-6.15.0"
+  applications  = ["HBase"]
+  log_uri       = var.log_uri
+
+  ec2_attributes {
+    subnet_id                         = var.subnet_id
+    key_name                          = var.key_name
+    emr_managed_master_security_group = aws_security_group.emr_sg.id
+    emr_managed_slave_security_group  = aws_security_group.emr_sg.id
+  }
+
+  master_instance_group {
+    instance_type = "m5.xlarge"
+    instance_count = 1
+  }
+
+  core_instance_group {
+    instance_type = "m5.xlarge"
+    instance_count = 1
+  }
+
+  bootstrap_actions {
+    path = "s3://your-bootstrap-scripts/mount-ebs.sh"
+    name = "Mount EBS"
+  }
+
+  service_role  = "EMR_DefaultRole"
+  job_flow_role = "EMR_EC2_DefaultRole"
+  auto_terminate = false
+  visible_to_all_users = true
+}
+
+
+****
+output.tf
+
+output "emr_master_dns" {
+  value = aws_emr_cluster.hbase.master_public_dns
+}
+
+output "ebs_volume_id" {
+  value = aws_ebs_volume.hbase_data.id
+}
+
+
+*******
+
+
+Backup Workflow
+After the cluster runs and data is written to the EBS volume:
+
+bash
+
+aws ec2 create-snapshot --volume-id <volume-id> --description "HBase EBS backup"
+
+
+You can then use this snapshot ID as a variable (snapshot_id) next time you run Terraform to reuse the volume's data.
+
+****
+
+Restore Workflow
+To restore on a new cluster:
+
+1.  Use previous snapshot ID as input in terraform apply:
+
+
+bash 
+
+terraform apply -var="snapshot_id=snap-xxxxxxxxxxxx"
+
+
+2. Terraform will create a volume from the snapshot and attach it.
+
+3.  The bootstrap script mounts it back to /mnt/data.
+
+****
+
+Limitations
+HBase must be configured to use /mnt/data as hbase.rootdir via configurations_json
+
+Snapshot/restore does not automatically restore HDFS state unless HDFS is mounted over EBS and configured accordingly
+
+Alternatively: export/import HBase snapshot to S3 is safer and EMR-native
+
+Would you like a version that uses HBase snapshots to/from S3 instead (more reliable and native to EMR)?
+
